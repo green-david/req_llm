@@ -97,18 +97,20 @@ defmodule ReqLLMTest do
       assert output =~ "Using unverified model: openai:tuple-fallback-model"
     end
 
-    test "resolves cohere string specs via inline model fallback" do
+    test "resolves cohere string specs through the catalog" do
       output =
         capture_io(:stderr, fn ->
           assert {:ok,
                   %LLMDB.Model{
                     provider: :cohere,
-                    id: "rerank-v3.5",
-                    provider_model_id: "rerank-v3.5"
-                  }} = ReqLLM.model("cohere:rerank-v3.5")
+                    id: "rerank-v3.5"
+                  } = model} = ReqLLM.model("cohere:rerank-v3.5")
+
+          assert get_in(model.capabilities, [:rerank]) == true
+          assert get_in(model.capabilities, [:chat]) == false
         end)
 
-      assert output =~ "Using unverified model: cohere:rerank-v3.5"
+      assert output == ""
     end
 
     test "resolves mistral string spec via inline fallback" do

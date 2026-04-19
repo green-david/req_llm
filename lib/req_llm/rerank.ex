@@ -260,9 +260,9 @@ defmodule ReqLLM.Rerank do
              %{query: query, documents: documents},
              opts
            ),
-         {:ok, %Req.Response{status: status, body: body}} when status in 200..299 <-
+         {:ok, %Req.Response{status: status} = response} when status in 200..299 <-
            Req.request(request) do
-      {:ok, body}
+      {:ok, response}
     else
       {:ok, %Req.Response{status: status, body: body}} ->
         {:error,
@@ -291,19 +291,25 @@ defmodule ReqLLM.Rerank do
       ids = Enum.map(parsed_batches, & &1.id)
       metas = Enum.map(parsed_batches, & &1.meta)
 
+      usages =
+        Enum.map(batch_responses, fn
+          {%Req.Response{private: private}, _offset} -> get_in(private, [:req_llm, :usage])
+          _ -> nil
+        end)
+
       {:ok,
        %RerankResponse{
          id: merge_ids(ids),
          model: model.provider_model_id || model.id,
          query: query,
          results: results,
-         meta: merge_meta(metas, length(parsed_batches))
+         meta: merge_meta(metas, length(parsed_batches), usages)
        }}
     end
   end
 
   defp parse_batch_responses(batch_responses, documents) do
-    Enum.reduce_while(batch_responses, {:ok, []}, fn {body, offset}, {:ok, acc} ->
+    Enum.reduce_while(batch_responses, {:ok, []}, fn {%{body: body}, offset}, {:ok, acc} ->
       case parse_batch_response(body, offset, documents) do
         {:ok, parsed} -> {:cont, {:ok, [parsed | acc]}}
         {:error, error} -> {:halt, {:error, error}}
@@ -469,7 +475,7 @@ defmodule ReqLLM.Rerank do
 
   defp normalize_warnings(_), do: nil
 
-  defp merge_meta(metas, batch_count) do
+  defp merge_meta(metas, batch_count, usages) do
     normalized_metas = Enum.reject(metas, &is_nil/1)
 
     %{}
@@ -478,7 +484,27 @@ defmodule ReqLLM.Rerank do
     |> maybe_put(:cached_tokens, sum_scalar_field(normalized_metas, :cached_tokens))
     |> maybe_put(:warnings, merge_warnings(normalized_metas))
     |> Map.put(:batch_count, batch_count)
+    |> Map.merge(merge_costs(usages))
   end
+
+  defp merge_costs(usages) do
+    Enum.reduce(usages, %{}, fn usage, acc ->
+      acc
+      |> maybe_sum_cost(usage, :input_cost)
+      |> maybe_sum_cost(usage, :output_cost)
+      |> maybe_sum_cost(usage, :reasoning_cost)
+      |> maybe_sum_cost(usage, :total_cost)
+    end)
+  end
+
+  defp maybe_sum_cost(acc, usage, field) when is_map(usage) do
+    case fetch_value(usage, field) do
+      value when is_number(value) -> Map.update(acc, field, value, &(&1 + value))
+      _ -> acc
+    end
+  end
+
+  defp maybe_sum_cost(acc, _usage, _field), do: acc
 
   defp merge_numeric_field(metas, field) do
     metas

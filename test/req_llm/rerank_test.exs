@@ -1,6 +1,8 @@
 defmodule ReqLLM.RerankTest do
   use ExUnit.Case, async: false
 
+  import ReqLLM.Test.Helpers, only: [pricing_from_cost: 1]
+
   alias ReqLLM.Rerank
 
   defp setup_telemetry do
@@ -36,6 +38,13 @@ defmodule ReqLLM.RerankTest do
   end
 
   describe "validate_model/1" do
+    test "accepts catalog rerank models" do
+      assert {:ok, %LLMDB.Model{provider: :cohere, id: "rerank-v3.5"} = model} =
+               Rerank.validate_model("cohere:rerank-v3.5")
+
+      assert get_in(model.capabilities, [:rerank]) == true
+    end
+
     test "accepts inline rerank models outside the catalog" do
       assert {:ok, %LLMDB.Model{provider: :cohere, id: "rerank-v3.5"}} =
                Rerank.validate_model(%{provider: :cohere, id: "rerank-v3.5"})
@@ -46,7 +55,7 @@ defmodule ReqLLM.RerankTest do
                Rerank.validate_model(%{
                  provider: :cohere,
                  id: "custom-rerank",
-                 capabilities: %{rerank: %{enabled: true}}
+                 capabilities: %{rerank: true}
                })
     end
 
@@ -147,7 +156,7 @@ defmodule ReqLLM.RerankTest do
     test "returns reranked results with original documents attached" do
       {:ok, response} =
         Rerank.rerank(
-          %{provider: :cohere, id: "rerank-v3.5"},
+          "cohere:rerank-v3.5",
           query: "capital of the United States?",
           documents: ["Carson City", "Washington, D.C.", "Saipan"],
           top_n: 2,
@@ -175,7 +184,7 @@ defmodule ReqLLM.RerankTest do
     test "merges batched rankings into a single global result set" do
       {:ok, response} =
         Rerank.rerank(
-          %{provider: :cohere, id: "rerank-v3.5"},
+          "cohere:rerank-v3.5",
           query: "best docs",
           documents: ["Doc 1", "Doc 2", "Doc 3", "Doc 4"],
           batch_size: 2,
@@ -194,6 +203,34 @@ defmodule ReqLLM.RerankTest do
                billed_units: %{search_units: 2},
                warnings: ["batch-two"],
                batch_count: 2
+             }
+    end
+
+    test "propagates computed cost fields when pricing metadata is available" do
+      model = %{
+        provider: :cohere,
+        id: "rerank-v3.5",
+        pricing: pricing_from_cost(%{input: 2.0, output: 3.0})
+      }
+
+      {:ok, response} =
+        Rerank.rerank(
+          model,
+          query: "capital of the United States?",
+          documents: ["Carson City", "Washington, D.C.", "Saipan"],
+          top_n: 2,
+          req_http_options: [plug: {Req.Test, __MODULE__.SingleBatch}]
+        )
+
+      assert response.meta == %{
+               billed_units: %{search_units: 1},
+               tokens: %{input_tokens: 12},
+               warnings: ["unit-test"],
+               batch_count: 1,
+               input_cost: 0.000024,
+               output_cost: 0.0,
+               reasoning_cost: 0.0,
+               total_cost: 0.000024
              }
     end
 
