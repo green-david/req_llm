@@ -149,11 +149,11 @@ defmodule ReqLLM.Providers.Anthropic.Response do
   end
 
   defp decode_content_block(%{"type" => "thinking", "thinking" => text} = block) do
-    ReqLLM.StreamChunk.thinking(text, thinking_metadata(block))
+    ReqLLM.StreamChunk.thinking(text, non_streaming_thinking_metadata(block))
   end
 
   defp decode_content_block(%{"type" => "thinking", "text" => text} = block) do
-    ReqLLM.StreamChunk.thinking(text, thinking_metadata(block))
+    ReqLLM.StreamChunk.thinking(text, non_streaming_thinking_metadata(block))
   end
 
   defp decode_content_block(%{"type" => "tool_use", "id" => id, "name" => name, "input" => input}) do
@@ -167,14 +167,14 @@ defmodule ReqLLM.Providers.Anthropic.Response do
     [ReqLLM.StreamChunk.text(text)]
   end
 
-  defp decode_content_block_delta(%{"type" => "thinking_delta", "thinking" => text}, _index)
+  defp decode_content_block_delta(%{"type" => "thinking_delta", "thinking" => text}, index)
        when is_binary(text) do
-    [ReqLLM.StreamChunk.thinking(text, thinking_metadata())]
+    [ReqLLM.StreamChunk.thinking(text, streaming_thinking_metadata(index))]
   end
 
-  defp decode_content_block_delta(%{"type" => "thinking_delta", "text" => text}, _index)
+  defp decode_content_block_delta(%{"type" => "thinking_delta", "text" => text}, index)
        when is_binary(text) do
-    [ReqLLM.StreamChunk.thinking(text, thinking_metadata())]
+    [ReqLLM.StreamChunk.thinking(text, streaming_thinking_metadata(index))]
   end
 
   defp decode_content_block_delta(
@@ -186,18 +186,23 @@ defmodule ReqLLM.Providers.Anthropic.Response do
     [ReqLLM.StreamChunk.meta(%{tool_call_args: %{index: index, fragment: fragment}})]
   end
 
+  defp decode_content_block_delta(%{"type" => "signature_delta", "signature" => signature}, index)
+       when is_binary(signature) do
+    [ReqLLM.StreamChunk.meta(%{thinking_signature: signature, content_block_index: index})]
+  end
+
   defp decode_content_block_delta(_, _index), do: []
 
   defp decode_content_block_start(%{"type" => "text", "text" => text}, _index) do
     [ReqLLM.StreamChunk.text(text)]
   end
 
-  defp decode_content_block_start(%{"type" => "thinking", "thinking" => text}, _index) do
-    [ReqLLM.StreamChunk.thinking(text, thinking_metadata())]
+  defp decode_content_block_start(%{"type" => "thinking", "thinking" => text}, index) do
+    [ReqLLM.StreamChunk.thinking(text, streaming_thinking_metadata(index))]
   end
 
-  defp decode_content_block_start(%{"type" => "thinking", "text" => text}, _index) do
-    [ReqLLM.StreamChunk.thinking(text, thinking_metadata())]
+  defp decode_content_block_start(%{"type" => "thinking", "text" => text}, index) do
+    [ReqLLM.StreamChunk.thinking(text, streaming_thinking_metadata(index))]
   end
 
   defp decode_content_block_start(%{"type" => "tool_use", "id" => id, "name" => name}, index) do
@@ -341,7 +346,7 @@ defmodule ReqLLM.Providers.Anthropic.Response do
   defp parse_finish_reason(reason) when is_binary(reason), do: :error
   defp parse_finish_reason(_), do: nil
 
-  defp thinking_metadata(block \\ %{}) do
+  defp non_streaming_thinking_metadata(block) do
     signature = Map.get(block, "signature")
 
     %{
@@ -350,6 +355,21 @@ defmodule ReqLLM.Providers.Anthropic.Response do
       provider: :anthropic,
       format: "anthropic-thinking-v1",
       provider_data: %{"type" => "thinking"}
+    }
+  end
+
+  defp streaming_thinking_metadata(content_block_index) do
+    # Thinking signature comes in a signature_delta event
+    # after the thinking_delta events in the same content
+    # block. Go ahead and put no signature and when we build
+    # the response, we will go fix these to have accurate signatures.
+    %{
+      signature: nil,
+      encrypted?: false,
+      provider: :anthropic,
+      format: "anthropic-thinking-v1",
+      provider_data: %{"type" => "thinking"},
+      content_block_index: content_block_index
     }
   end
 end
