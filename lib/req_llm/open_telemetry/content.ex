@@ -34,6 +34,8 @@ defmodule ReqLLM.OpenTelemetry.Content do
   `video_url`, `file`) so thinking output cannot leak through.
   """
 
+  require Logger
+
   alias ReqLLM.{MapAccess, Message, Response, ToolCall, ToolResult}
   alias ReqLLM.Message.ContentPart
 
@@ -201,7 +203,7 @@ defmodule ReqLLM.OpenTelemetry.Content do
         %{"type" => "function", "name" => name}
         |> maybe_put("description", fetch_field(tool, :description))
         |> maybe_put("strict", fetch_field(tool, :strict))
-        |> maybe_put("parameters", fetch_field(tool, :parameter_schema))
+        |> maybe_put_parameters(name, fetch_field(tool, :parameter_schema))
 
       is_binary(type) and type != "" ->
         %{"type" => type}
@@ -215,6 +217,24 @@ defmodule ReqLLM.OpenTelemetry.Content do
   end
 
   defp tool_to_otel(_), do: nil
+
+  defp maybe_put_parameters(map, _name, nil), do: map
+  defp maybe_put_parameters(map, _name, []), do: map
+
+  defp maybe_put_parameters(map, name, value) do
+    case Jason.encode(value) do
+      {:ok, _json} ->
+        Map.put(map, "parameters", value)
+
+      {:error, reason} ->
+        Logger.debug(fn ->
+          "ReqLLM.OpenTelemetry: dropping tool #{inspect(name)} parameters — " <>
+            "not JSON-encodable: #{inspect(reason)}"
+        end)
+
+        map
+    end
+  end
 
   defp fetch_field(map, key) when is_map(map) and is_atom(key) do
     case Map.fetch(map, key) do

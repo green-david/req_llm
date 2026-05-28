@@ -291,5 +291,55 @@ defmodule ReqLLM.OpenTelemetry.ContentTest do
                |> Content.tool_definitions()
                |> decode_all()
     end
+
+    test "drops parameters that aren't JSON-encodable instead of crashing the bridge" do
+      nimble_options_schema = [
+        answer: [type: {:or, [:string, nil]}, required: true],
+        tags: [type: {:list, :string}, default: []]
+      ]
+
+      tools = [
+        %{
+          name: "structured_output",
+          description: "Return the answer",
+          parameter_schema: nimble_options_schema
+        }
+      ]
+
+      log =
+        ExUnit.CaptureLog.capture_log([level: :debug], fn ->
+          assert [tool] =
+                   %{request_payload: %{tools: tools}}
+                   |> Content.tool_definitions()
+                   |> decode_all()
+
+          assert tool["name"] == "structured_output"
+          assert tool["description"] == "Return the answer"
+          refute Map.has_key?(tool, "parameters")
+        end)
+
+      assert log =~ "dropping tool \"structured_output\" parameters"
+    end
+
+    test "keeps parameters that are valid JSON Schema" do
+      tools = [
+        %{
+          name: "get_weather",
+          parameter_schema: %{
+            "type" => "object",
+            "properties" => %{"city" => %{"type" => "string"}},
+            "required" => ["city"]
+          }
+        }
+      ]
+
+      assert [tool] =
+               %{request_payload: %{tools: tools}}
+               |> Content.tool_definitions()
+               |> decode_all()
+
+      assert tool["parameters"]["type"] == "object"
+      assert tool["parameters"]["required"] == ["city"]
+    end
   end
 end

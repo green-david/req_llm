@@ -35,19 +35,29 @@ defmodule ReqLLM.OpenTelemetry.Adapter do
   ## Example — inject caller-context on every ReqLLM span
 
   The cleanest way to wrap the default adapter is to delegate everything and
-  override just `start_span/3` to merge in extra attributes:
+  override just `start_span/3` to merge in extra attributes. Include the
+  optional callbacks in the delegation if your app uses tools — otherwise
+  server-side tool sub-spans render as siblings of the LLM span instead of
+  children, losing the call-tree shape Langfuse / Honeycomb / Grafana use to
+  group tool execution under its parent.
 
       defmodule MyApp.ReqLLMAdapter do
         @behaviour ReqLLM.OpenTelemetry.Adapter
 
+        # required callbacks
         defdelegate available?(), to: ReqLLM.OpenTelemetry.OTelAdapter
-        defdelegate metrics_available?(), to: ReqLLM.OpenTelemetry.OTelAdapter
         defdelegate set_attributes(s, a, c), to: ReqLLM.OpenTelemetry.OTelAdapter
         defdelegate add_event(s, n, a, c), to: ReqLLM.OpenTelemetry.OTelAdapter
         defdelegate set_status(s, k, m, c), to: ReqLLM.OpenTelemetry.OTelAdapter
         defdelegate end_span(s, c), to: ReqLLM.OpenTelemetry.OTelAdapter
-        defdelegate record_histogram(r, c), to: ReqLLM.OpenTelemetry.OTelAdapter
 
+        # optional callbacks — delegate to preserve metrics + child-span shape
+        defdelegate metrics_available?(), to: ReqLLM.OpenTelemetry.OTelAdapter
+        defdelegate record_histogram(r, c), to: ReqLLM.OpenTelemetry.OTelAdapter
+        defdelegate start_child_span(p, n, a, o, c), to: ReqLLM.OpenTelemetry.OTelAdapter
+        defdelegate end_span_at(s, t, c), to: ReqLLM.OpenTelemetry.OTelAdapter
+
+        # the one callback we actually customize
         def start_span(name, attrs, config) do
           extras = %{"langfuse.user.id" => Process.get(:current_user_id)}
           ReqLLM.OpenTelemetry.OTelAdapter.start_span(name, Map.merge(attrs, extras), config)
@@ -373,6 +383,8 @@ defmodule ReqLLM.OpenTelemetry do
   `ReqLLM.Telemetry.OpenTelemetry`.
   """
 
+  require Logger
+
   alias ReqLLM.MapAccess
   alias ReqLLM.OpenTelemetry.{Attributes, SemConv, Translator}
   alias ReqLLM.Telemetry.OpenTelemetry, as: Mapper
@@ -423,8 +435,14 @@ defmodule ReqLLM.OpenTelemetry do
     as a single `gen_ai.client.inference.operation.details` span event on
     the terminal lifecycle event. `true` is accepted as an alias for
     `:attributes`.
-  - `:langfuse` — when `true`, also adds `langfuse.observation.cost_details`
-    (JSON-encoded breakdown) when ReqLLM has computed a cost.
+  - `:langfuse` — when `true`, adds Langfuse-specific attributes the regular
+    `gen_ai.*` set doesn't cover:
+      * `langfuse.observation.cost_details` — JSON-encoded `input` / `output` /
+        `reasoning` / `total` breakdown, when ReqLLM has computed a cost.
+      * `langfuse.observation.completion_start_time` — ISO 8601 timestamp of
+        the first streamed chunk, used by Langfuse to compute time-to-first-
+        token. Only set for streaming requests that produced at least one
+        chunk.
 
   Content capture additionally requires `telemetry: [payloads: :raw]` on the
   call so the request/response payloads are available to map.
@@ -500,7 +518,19 @@ defmodule ReqLLM.OpenTelemetry do
 
   @doc false
   @spec handle_event(list(atom()), map(), map(), keyword()) :: :ok
-  def handle_event([:req_llm, :request, :start], _measurements, metadata, config) do
+  def handle_event(event, measurements, metadata, config) do
+    do_handle_event(event, measurements, metadata, config)
+  rescue
+    error ->
+      Logger.warning(fn ->
+        "ReqLLM.OpenTelemetry: handler crashed on #{inspect(event)} — " <>
+          Exception.format(:error, error, __STACKTRACE__)
+      end)
+
+      :ok
+  end
+
+  defp do_handle_event([:req_llm, :request, :start], _measurements, metadata, config) do
     ensure_span_table()
 
     if request_id = MapAccess.get(metadata, :request_id) do
@@ -516,7 +546,7 @@ defmodule ReqLLM.OpenTelemetry do
     :ok
   end
 
-  def handle_event([:req_llm, :request, :stop], measurements, metadata, config) do
+  defp do_handle_event([:req_llm, :request, :stop], measurements, metadata, config) do
     with request_id when is_binary(request_id) <- MapAccess.get(metadata, :request_id),
          {:ok, span} <- take_span(config, request_id) do
       stub = Mapper.request_stop(metadata, terminal_opts(config, measurements))
@@ -526,7 +556,7 @@ defmodule ReqLLM.OpenTelemetry do
     :ok
   end
 
-  def handle_event([:req_llm, :request, :exception], measurements, metadata, config) do
+  defp do_handle_event([:req_llm, :request, :exception], measurements, metadata, config) do
     with request_id when is_binary(request_id) <- MapAccess.get(metadata, :request_id),
          {:ok, span} <- take_span(config, request_id) do
       stub = Mapper.request_exception(metadata, terminal_opts(config, measurements))
