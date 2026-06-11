@@ -1150,12 +1150,10 @@ defmodule ReqLLM.Provider.Defaults do
 
             if finish_reason do
               normalized_reason = parse_openai_finish_reason(finish_reason)
-
-              meta = %{finish_reason: normalized_reason}
-              meta = if normalized_reason, do: Map.put(meta, :terminal?, true), else: meta
+              meta_chunk = ReqLLM.StreamChunk.meta(%{finish_reason: normalized_reason})
 
               content_chunks ++
-                reasoning_details_chunks ++ logprobs_chunks ++ [ReqLLM.StreamChunk.meta(meta)]
+                reasoning_details_chunks ++ logprobs_chunks ++ [meta_chunk]
             else
               content_chunks ++ reasoning_details_chunks ++ logprobs_chunks
             end

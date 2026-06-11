@@ -145,4 +145,43 @@ defmodule ReqLLM.StreamServer.MetadataTest do
       StreamServer.cancel(server)
     end
   end
+
+  describe "usage arriving after finish_reason (default decoder)" do
+    defmodule DefaultsDecodeProvider do
+      @moduledoc false
+    end
+
+    test "usage in a separate network chunk after finish_reason is captured" do
+      server = start_server(provider_mod: DefaultsDecodeProvider)
+      _task = mock_http_task(server)
+
+      metadata_task = Task.async(fn -> StreamServer.await_metadata(server, 500) end)
+      :timer.sleep(20)
+
+      finish_payload =
+        Jason.encode!(%{
+          "id" => "gen-123",
+          "choices" => [%{"delta" => %{}, "finish_reason" => "tool_calls"}]
+        })
+
+      usage_payload =
+        Jason.encode!(%{
+          "id" => "gen-123",
+          "choices" => [],
+          "usage" => %{"prompt_tokens" => 100, "completion_tokens" => 25, "total_tokens" => 125}
+        })
+
+      StreamServer.http_event(server, {:data, "data: #{finish_payload}\n\n"})
+      StreamServer.http_event(server, {:data, "data: #{usage_payload}\n\n"})
+      StreamServer.http_event(server, {:data, "data: [DONE]\n\n"})
+      StreamServer.http_event(server, :done)
+
+      assert {:ok, metadata} = Task.await(metadata_task)
+      assert metadata.finish_reason == :tool_calls
+      assert metadata.usage.input_tokens == 100
+      assert metadata.usage.output_tokens == 25
+
+      StreamServer.cancel(server)
+    end
+  end
 end
