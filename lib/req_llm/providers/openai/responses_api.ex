@@ -30,6 +30,17 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
   - Token limits use `max_output_tokens` instead of `max_tokens`
   - Tool choice format: `{type: "function", name: "tool_name"}`
   - Reasoning effort: `{effort: "high"}` format
+  - **Code Interpreter**: tool maps such as `%{"type" => "code_interpreter", "container" => ...}`
+    are passed through unchanged to OpenAI. Both object containers
+    (`%{"type" => "auto", ...}`) and string container IDs are supported.
+    This is Responses-API-only; Chat Completions does not support the
+    `code_interpreter` tool type.
+
+  ## Code Interpreter
+
+  Raw `code_interpreter_*` output items from the response are collected in
+  `response.provider_meta["code_interpreter"]["items"]` and are excluded from
+  normal text and function tool-call extraction.
 
   ## Decoding
 
@@ -59,13 +70,14 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
   require Logger
   require ReqLLM.Debug, as: Debug
 
-  @builtin_tool_types ~w(web_search web_search_preview file_search mcp x_search)
+  @builtin_tool_types ~w(web_search web_search_preview file_search mcp x_search code_interpreter)
   @tool_usage_type_atoms %{
     "web_search" => :web_search,
     "web_search_preview" => :web_search_preview,
     "file_search" => :file_search,
     "mcp" => :mcp,
-    "x_search" => :x_search
+    "x_search" => :x_search,
+    "code_interpreter" => :code_interpreter
   }
   @tool_call_atom_keys %{
     "web_search_call" => :web_search_call,
@@ -266,6 +278,8 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
     meta =
       maybe_put_reasoning_details(meta, extract_reasoning_details_from_segments(response_output))
 
+    meta = merge_code_interpreter_meta(meta, response_output)
+
     meta = merge_response_provider_meta(meta, data["response"] || %{})
 
     [ReqLLM.StreamChunk.meta(meta)]
@@ -305,6 +319,20 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
   end
 
   defp merge_response_provider_meta(meta, _), do: meta
+
+  defp merge_code_interpreter_meta(meta, response_output) when is_list(response_output) do
+    items = extract_code_interpreter_items(response_output)
+
+    if items == [] do
+      meta
+    else
+      provider_meta = Map.get(meta, :provider_meta, %{})
+      updated = put_code_interpreter_meta(provider_meta, items)
+      Map.put(meta, :provider_meta, updated)
+    end
+  end
+
+  defp merge_code_interpreter_meta(meta, _), do: meta
 
   defp drop_blanks(map) do
     map
@@ -1142,19 +1170,24 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
         end
 
       type when is_binary(type) ->
-        if Map.has_key?(@tool_call_atom_keys, type) do
-          [
-            ReqLLM.StreamChunk.meta(%{
-              builtin_tool_started: %{
-                id: item["id"] || item[:id] || item["call_id"] || item[:call_id],
-                name: type,
-                index: stream_output_index(data),
-                started_at_unix_nano: System.system_time(:nanosecond)
-              }
-            })
-          ]
-        else
-          []
+        cond do
+          code_interpreter_item?(item) ->
+            [ReqLLM.StreamChunk.meta(%{code_interpreter_item: item})]
+
+          Map.has_key?(@tool_call_atom_keys, type) ->
+            [
+              ReqLLM.StreamChunk.meta(%{
+                builtin_tool_started: %{
+                  id: item["id"] || item[:id] || item["call_id"] || item[:call_id],
+                  name: type,
+                  index: stream_output_index(data),
+                  started_at_unix_nano: System.system_time(:nanosecond)
+                }
+              })
+            ]
+
+          true ->
+            []
         end
 
       _ ->
@@ -1175,19 +1208,22 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
   defp handle_output_item_done(_, _), do: []
 
   defp handle_output_item_done_item(item, data, state) do
-    case item["type"] || item[:type] do
-      "function_call" ->
+    type = item["type"] || item[:type]
+
+    cond do
+      type == "function_call" ->
         handle_function_call_item_done(item, data, state)
 
-      "message" ->
+      type == "message" ->
         handle_message_item_done(item, data, state)
 
-      type when is_binary(type) ->
-        if Map.has_key?(@tool_call_atom_keys, type),
-          do: handle_builtin_call_item_done(item, data, state, type),
-          else: []
+      code_interpreter_item?(item) ->
+        [ReqLLM.StreamChunk.meta(%{code_interpreter_item: item})]
 
-      _ ->
+      is_binary(type) and Map.has_key?(@tool_call_atom_keys, type) ->
+        handle_builtin_call_item_done(item, data, state, type)
+
+      true ->
         []
     end
   end
@@ -1645,6 +1681,7 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
     thinking = aggregate_reasoning_segments(output_segments)
     tool_calls = extract_tool_calls_from_segments(output_segments)
     reasoning_details = extract_reasoning_details_from_segments(output_segments)
+    code_interpreter_items = extract_code_interpreter_items(output_segments)
 
     base_usage = %{
       input_tokens: get_in(body, ["usage", "input_tokens"]) || 0,
@@ -1682,7 +1719,10 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
       |> Map.drop(["id", "model", "output_text", "output", "usage"])
       |> Map.put("api_type", "responses")
 
-    provider_meta = Map.merge(base_provider_meta, object_meta)
+    provider_meta =
+      base_provider_meta
+      |> Map.merge(object_meta)
+      |> put_code_interpreter_meta(code_interpreter_items)
 
     response = %ReqLLM.Response{
       id: body["id"] || "unknown",
@@ -2025,6 +2065,22 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
   end
 
   defp extract_summary_text(_), do: nil
+
+  defp extract_code_interpreter_items(segments) when is_list(segments) do
+    Enum.filter(segments, &code_interpreter_item?/1)
+  end
+
+  defp extract_code_interpreter_items(_), do: []
+
+  defp code_interpreter_item?(%{"type" => "code_interpreter" <> _}), do: true
+  defp code_interpreter_item?(%{type: "code_interpreter" <> _}), do: true
+  defp code_interpreter_item?(_), do: false
+
+  defp put_code_interpreter_meta(provider_meta, []), do: provider_meta
+
+  defp put_code_interpreter_meta(provider_meta, items) when is_list(items) do
+    Map.put(provider_meta, "code_interpreter", %{"items" => items})
+  end
 
   defp normalize_arguments_json(nil), do: "{}"
   defp normalize_arguments_json(""), do: "{}"

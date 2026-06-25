@@ -303,6 +303,44 @@ response.usage.cost
 
 Responses API server-side tools may also appear in `response.message.tool_calls` as builtin records (for example `web_search_call` or `file_search_call`). They are preserved for observability, but the provider already executed them: do not replay them as local tool calls. `ReqLLM.Response.classify/1` and `ReqLLM.StreamResponse.classify/1` treat builtin-only responses as final answers.
 
+### Code Interpreter (Responses API)
+
+Models using the Responses API support the Code Interpreter tool, which runs Python code in a sandboxed container. Pass the tool as a map and ReqLLM will forward it unchanged to OpenAI:
+
+```elixir
+{:ok, response} = ReqLLM.generate_text(
+  "openai:gpt-5-mini",
+  "What is the factorial of 12804/53 + 300? Solve with Python.",
+  tools: [%{
+    "type" => "code_interpreter",
+    "container" => %{"type" => "auto", "memory_limit" => "4g"}
+  }]
+)
+
+# Access the raw code interpreter output items
+response.provider_meta["code_interpreter"]["items"]
+#=> [
+#=>   %{
+#=>     "type" => "code_interpreter_call",
+#=>     "code" => "from fractions import Fraction...",
+#=>     "status" => "completed",
+#=>     ...
+#=>   }
+#=> ]
+
+# Access code interpreter usage
+response.usage.tool_usage.code_interpreter
+#=> %{count: 1, unit: :call}
+```
+
+The container value may also be an existing container ID string:
+
+```elixir
+tools: [%{"type" => "code_interpreter", "container" => "cntr_abc123"}]
+```
+
+Code Interpreter is a server-side builtin: the provider executes the code and returns the result items. Do not replay them as local tool calls. `ReqLLM.Response.classify/1` treats these responses as final answers.
+
 ### Image Generation
 
 Image generation costs are tracked separately:

@@ -130,6 +130,50 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
       assert Enum.sort(encoded_tool["parameters"]["required"]) == ["location", "units"]
     end
 
+    test "passes through code_interpreter tool maps unchanged" do
+      tool = %{
+        "type" => "code_interpreter",
+        "container" => %{"type" => "auto", "memory_limit" => "4g"}
+      }
+
+      request = build_request(tools: [tool])
+
+      encoded = ResponsesAPI.encode_body(request)
+      body = ReqLLM.Test.Helpers.json_body(encoded)
+
+      assert [encoded_tool] = body["tools"]
+      assert encoded_tool["type"] == "code_interpreter"
+      assert encoded_tool["container"] == %{"type" => "auto", "memory_limit" => "4g"}
+      refute Map.has_key?(encoded_tool, "strict")
+      refute Map.has_key?(encoded_tool, "parameters")
+    end
+
+    test "passes through atom-keyed code_interpreter tool maps" do
+      tool = %{type: :code_interpreter, container: %{type: :auto, memory_limit: "4g"}}
+
+      request = build_request(tools: [tool])
+
+      encoded = ResponsesAPI.encode_body(request)
+      body = ReqLLM.Test.Helpers.json_body(encoded)
+
+      assert [encoded_tool] = body["tools"]
+      assert encoded_tool["type"] == "code_interpreter"
+      assert encoded_tool["container"] == %{"type" => "auto", "memory_limit" => "4g"}
+    end
+
+    test "passes through string container IDs for code_interpreter" do
+      tool = %{"type" => "code_interpreter", "container" => "cntr_abc123"}
+
+      request = build_request(tools: [tool])
+
+      encoded = ResponsesAPI.encode_body(request)
+      body = ReqLLM.Test.Helpers.json_body(encoded)
+
+      assert [encoded_tool] = body["tools"]
+      assert encoded_tool["type"] == "code_interpreter"
+      assert encoded_tool["container"] == "cntr_abc123"
+    end
+
     test "does not emit unverified-model warnings when the request uses the id field" do
       warning =
         ExUnit.CaptureIO.capture_io(:stderr, fn ->
@@ -1067,6 +1111,141 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
       assert resp.body.usage.total_tokens == 0
     end
 
+    test "collects code_interpreter output items in provider_meta" do
+      response_body = %{
+        "id" => "resp_123",
+        "model" => "gpt-5",
+        "output" => [
+          %{
+            "type" => "message",
+            "content" => [%{"type" => "output_text", "text" => "The result is 4."}]
+          },
+          %{
+            "type" => "code_interpreter_call",
+            "id" => "ci_xxx",
+            "code" => "print(2+2)",
+            "status" => "completed"
+          },
+          %{
+            "type" => "code_interpreter_logs",
+            "call_id" => "ci_xxx",
+            "logs" => "4\n"
+          },
+          %{
+            "type" => "code_interpreter_interpretation",
+            "call_id" => "ci_xxx",
+            "text" => "The result is 4."
+          }
+        ],
+        "usage" => %{"input_tokens" => 5, "output_tokens" => 10}
+      }
+
+      {_req, resp} = ResponsesAPI.decode_response(build_response(200, response_body))
+
+      assert [part] = resp.body.message.content
+      assert part.type == :text
+      assert part.text == "The result is 4."
+      assert resp.body.message.tool_calls == nil
+
+      assert [call, logs, interpretation] =
+               get_in(resp.body.provider_meta, ["code_interpreter", "items"])
+
+      assert call["type"] == "code_interpreter_call"
+      assert call["id"] == "ci_xxx"
+      assert logs["type"] == "code_interpreter_logs"
+      assert logs["logs"] == "4\n"
+      assert interpretation["type"] == "code_interpreter_interpretation"
+      assert interpretation["text"] == "The result is 4."
+    end
+
+    test "preserves code_interpreter_call outputs in provider_meta" do
+      response_body = %{
+        "id" => "resp_123",
+        "model" => "gpt-5",
+        "output" => [
+          %{
+            "type" => "code_interpreter_call",
+            "id" => "ci_xxx",
+            "code" => "print(2+2)",
+            "status" => "completed",
+            "outputs" => [
+              %{"type" => "code_interpreter_logs", "logs" => "4\n"},
+              %{"type" => "code_interpreter_interpretation", "text" => "Four."}
+            ]
+          }
+        ],
+        "usage" => %{"input_tokens" => 5, "output_tokens" => 10}
+      }
+
+      {_req, resp} = ResponsesAPI.decode_response(build_response(200, response_body))
+
+      assert [item] = get_in(resp.body.provider_meta, ["code_interpreter", "items"])
+      assert item["type"] == "code_interpreter_call"
+      assert [logs, interpretation] = item["outputs"]
+      assert logs["type"] == "code_interpreter_logs"
+      assert logs["logs"] == "4\n"
+      assert interpretation["type"] == "code_interpreter_interpretation"
+      assert interpretation["text"] == "Four."
+    end
+
+    test "counts code_interpreter usage in tool_usage" do
+      response_body = %{
+        "id" => "resp_123",
+        "model" => "gpt-5",
+        "output" => [
+          %{
+            "type" => "code_interpreter_call",
+            "id" => "ci_xxx",
+            "code" => "print(2+2)",
+            "status" => "completed"
+          }
+        ],
+        "usage" => %{"input_tokens" => 5, "output_tokens" => 10}
+      }
+
+      {_req, resp} = ResponsesAPI.decode_response(build_response(200, response_body))
+
+      assert resp.body.usage.tool_usage == %{code_interpreter: %{count: 1, unit: :call}}
+    end
+
+    test "keeps text and function calls separate from code_interpreter items" do
+      response_body = %{
+        "id" => "resp_123",
+        "model" => "gpt-5",
+        "output" => [
+          %{
+            "type" => "message",
+            "content" => [%{"type" => "output_text", "text" => "The result is 4."}]
+          },
+          %{
+            "type" => "function_call",
+            "call_id" => "call_123",
+            "name" => "get_weather",
+            "arguments" => ~s({"location":"SF"})
+          },
+          %{
+            "type" => "code_interpreter_call",
+            "id" => "ci_xxx",
+            "code" => "print(2+2)",
+            "status" => "completed"
+          }
+        ],
+        "usage" => %{"input_tokens" => 5, "output_tokens" => 10}
+      }
+
+      {_req, resp} = ResponsesAPI.decode_response(build_response(200, response_body))
+
+      assert [part] = resp.body.message.content
+      assert part.type == :text
+      assert part.text == "The result is 4."
+
+      assert [%ReqLLM.ToolCall{function: %{name: "get_weather"}}] = resp.body.message.tool_calls
+
+      assert [call] = get_in(resp.body.provider_meta, ["code_interpreter", "items"])
+      assert call["type"] == "code_interpreter_call"
+      assert call["id"] == "ci_xxx"
+    end
+
     test "appends message to request context" do
       msg = %ReqLLM.Message{
         role: :user,
@@ -1472,6 +1651,79 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
       assert chunk.metadata.id == "ws_1"
       assert chunk.metadata.builtin? == true
       assert is_integer(chunk.metadata.done_at_unix_nano)
+    end
+
+    test "emits code_interpreter items from output_item.added", %{model: model} do
+      event = %{
+        data: %{
+          "event" => "response.output_item.added",
+          "output_index" => 0,
+          "item" => %{
+            "id" => "ci_xxx",
+            "type" => "code_interpreter_call",
+            "code" => "print(2+2)",
+            "status" => "in_progress"
+          }
+        }
+      }
+
+      assert [%ReqLLM.StreamChunk{type: :meta, metadata: metadata}] =
+               ResponsesAPI.decode_stream_event(event, model)
+
+      assert metadata.code_interpreter_item["type"] == "code_interpreter_call"
+      assert metadata.code_interpreter_item["id"] == "ci_xxx"
+    end
+
+    test "emits code_interpreter items from output_item.done", %{model: model} do
+      event = %{
+        data: %{
+          "event" => "response.output_item.done",
+          "output_index" => 0,
+          "item" => %{
+            "type" => "code_interpreter_logs",
+            "call_id" => "ci_xxx",
+            "logs" => "4\n"
+          }
+        }
+      }
+
+      assert [%ReqLLM.StreamChunk{type: :meta, metadata: metadata}] =
+               ResponsesAPI.decode_stream_event(event, model)
+
+      assert metadata.code_interpreter_item["type"] == "code_interpreter_logs"
+      assert metadata.code_interpreter_item["logs"] == "4\n"
+    end
+
+    test "collects code_interpreter items in response.completed provider_meta", %{model: model} do
+      completed = %{
+        data: %{
+          "event" => "response.completed",
+          "response" => %{
+            "id" => "resp_123",
+            "output" => [
+              %{
+                "type" => "code_interpreter_call",
+                "id" => "ci_xxx",
+                "code" => "print(2+2)",
+                "status" => "completed"
+              },
+              %{
+                "type" => "code_interpreter_logs",
+                "call_id" => "ci_xxx",
+                "logs" => "4\n"
+              }
+            ]
+          }
+        }
+      }
+
+      assert [%ReqLLM.StreamChunk{type: :meta, metadata: metadata}] =
+               ResponsesAPI.decode_stream_event(completed, model)
+
+      assert metadata.terminal? == true
+      assert [call, logs] = get_in(metadata.provider_meta, ["code_interpreter", "items"])
+      assert call["type"] == "code_interpreter_call"
+      assert logs["type"] == "code_interpreter_logs"
     end
 
     test "stateful decoding avoids duplicate completed output items", %{model: model} do
